@@ -1,5 +1,12 @@
 # loro.js
 
+## 0.2.0
+
+### Minor Changes
+
+- 880028d: Store text operations in shared range-backed buffers, read visible spans without
+  allocating scalar views, and add lazy line navigation plus explicit text compaction.
+
 ## 0.1.0
 
 ### Minor Changes
