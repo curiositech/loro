@@ -1,4 +1,7 @@
-use loro::{LoroDoc, UndoManager, UndoOrRedo};
+use loro::{
+    ContainerID, ContainerTrait, LoroDoc, LoroMap, LoroTree, TreeID, TreeParentId, UndoManager,
+    UndoOrRedo,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 fn insert(text: &loro::LoroText, pos: usize, value: &str) {
@@ -18,6 +21,35 @@ fn sync(from: &LoroDoc, to: &LoroDoc) {
 
 fn deep(doc: &LoroDoc) -> serde_json::Value {
     serde_json::to_value(doc.get_deep_value()).unwrap()
+}
+
+fn apply_in_parity(
+    preview_doc: &LoroDoc,
+    preview_undo: &mut UndoManager,
+    ordinary_doc: &LoroDoc,
+    ordinary_undo: &mut UndoManager,
+    action: UndoOrRedo,
+) {
+    let preview = match action {
+        UndoOrRedo::Undo => preview_undo.preview_undo().unwrap().unwrap(),
+        UndoOrRedo::Redo => preview_undo.preview_redo().unwrap().unwrap(),
+    };
+    assert!(preview.will_apply());
+    assert_eq!(preview.pop_count(), 1);
+    assert!(preview.peer_counter_advance() > 0);
+
+    let ordinary_applied = match action {
+        UndoOrRedo::Undo => ordinary_undo.undo().unwrap(),
+        UndoOrRedo::Redo => ordinary_undo.redo().unwrap(),
+    };
+    assert_eq!(
+        preview_undo.apply_preview(action, preview).unwrap(),
+        ordinary_applied
+    );
+    assert_eq!(deep(preview_doc), deep(ordinary_doc));
+    assert_eq!(preview_doc.oplog_vv(), ordinary_doc.oplog_vv());
+    assert_eq!(preview_undo.undo_count(), ordinary_undo.undo_count());
+    assert_eq!(preview_undo.redo_count(), ordinary_undo.redo_count());
 }
 
 #[test]
@@ -383,6 +415,177 @@ fn map_list_movable_tree_and_richtext_match_ordinary_engine() {
             ordinary_doc.get_text("richtext").get_richtext_value()
         );
     }
+}
+
+fn seed_tree_move(doc: &LoroDoc) -> (LoroTree, TreeID, TreeID, TreeID) {
+    let tree = doc.get_tree("tree_move");
+    let left = tree.create(TreeParentId::Root).unwrap();
+    let right = tree.create(TreeParentId::Root).unwrap();
+    let moved = tree.create(TreeParentId::Node(left)).unwrap();
+    tree.get_meta(left)
+        .unwrap()
+        .insert("label", "left")
+        .unwrap();
+    tree.get_meta(right)
+        .unwrap()
+        .insert("label", "right")
+        .unwrap();
+    tree.get_meta(moved)
+        .unwrap()
+        .insert("label", "moved")
+        .unwrap();
+    doc.commit();
+    (tree, left, right, moved)
+}
+
+#[test]
+fn tree_move_preview_apply_matches_ordinary_undo_redo() {
+    let preview_doc = LoroDoc::new();
+    let ordinary_doc = LoroDoc::new();
+    preview_doc.set_peer_id(501).unwrap();
+    ordinary_doc.set_peer_id(501).unwrap();
+    let (preview_tree, preview_left, preview_right, preview_moved) = seed_tree_move(&preview_doc);
+    let (ordinary_tree, ordinary_left, ordinary_right, ordinary_moved) =
+        seed_tree_move(&ordinary_doc);
+    let initial = deep(&preview_doc);
+    assert_eq!(initial, deep(&ordinary_doc));
+
+    // Construct managers after seeding so the move is the sole history item.
+    let mut preview_undo = UndoManager::new(&preview_doc);
+    let mut ordinary_undo = UndoManager::new(&ordinary_doc);
+    assert_eq!(preview_undo.undo_count(), 0);
+    assert_eq!(ordinary_undo.undo_count(), 0);
+
+    preview_tree
+        .mov(preview_moved, TreeParentId::Node(preview_right))
+        .unwrap();
+    ordinary_tree
+        .mov(ordinary_moved, TreeParentId::Node(ordinary_right))
+        .unwrap();
+    preview_doc.commit();
+    ordinary_doc.commit();
+    let moved = deep(&preview_doc);
+    assert_eq!(moved, deep(&ordinary_doc));
+    assert_ne!(moved, initial);
+
+    apply_in_parity(
+        &preview_doc,
+        &mut preview_undo,
+        &ordinary_doc,
+        &mut ordinary_undo,
+        UndoOrRedo::Undo,
+    );
+    assert_eq!(deep(&preview_doc), initial);
+    assert_eq!(
+        preview_tree.parent(preview_moved),
+        Some(TreeParentId::Node(preview_left))
+    );
+    assert_eq!(
+        ordinary_tree.parent(ordinary_moved),
+        Some(TreeParentId::Node(ordinary_left))
+    );
+
+    apply_in_parity(
+        &preview_doc,
+        &mut preview_undo,
+        &ordinary_doc,
+        &mut ordinary_undo,
+        UndoOrRedo::Redo,
+    );
+    assert_eq!(deep(&preview_doc), moved);
+    assert_eq!(
+        preview_tree.parent(preview_moved),
+        Some(TreeParentId::Node(preview_right))
+    );
+    assert_eq!(
+        ordinary_tree.parent(ordinary_moved),
+        Some(TreeParentId::Node(ordinary_right))
+    );
+}
+
+fn seed_nested_nonmergeable_map(doc: &LoroDoc) -> (LoroMap, ContainerID) {
+    let root = doc.get_map("remap_root");
+    let outer = root.insert_container("outer", LoroMap::new()).unwrap();
+    outer.insert("label", "outer").unwrap();
+    let nested = outer.insert_container("nested", LoroMap::new()).unwrap();
+    nested.insert("label", "nested").unwrap();
+    let leaf = nested.insert_container("leaf", LoroMap::new()).unwrap();
+    leaf.insert("value", "seed").unwrap();
+    let nested_id = nested.id();
+    doc.commit();
+    (outer, nested_id)
+}
+
+#[test]
+fn nested_nonmergeable_map_remap_preview_apply_matches_ordinary_undo_redo() {
+    let preview_doc = LoroDoc::new();
+    let ordinary_doc = LoroDoc::new();
+    preview_doc.set_peer_id(502).unwrap();
+    ordinary_doc.set_peer_id(502).unwrap();
+    let (preview_outer, preview_original_nested) = seed_nested_nonmergeable_map(&preview_doc);
+    let (ordinary_outer, ordinary_original_nested) = seed_nested_nonmergeable_map(&ordinary_doc);
+    let seeded = deep(&preview_doc);
+    assert_eq!(seeded, deep(&ordinary_doc));
+
+    // Fresh managers begin with empty history and container-remap state. The
+    // deletion below is their first and only item.
+    let mut preview_undo = UndoManager::new(&preview_doc);
+    let mut ordinary_undo = UndoManager::new(&ordinary_doc);
+    assert_eq!(preview_undo.undo_count(), 0);
+    assert_eq!(ordinary_undo.undo_count(), 0);
+
+    preview_outer.delete("nested").unwrap();
+    ordinary_outer.delete("nested").unwrap();
+    preview_doc.commit();
+    ordinary_doc.commit();
+    let deleted = deep(&preview_doc);
+    assert_eq!(deleted, deep(&ordinary_doc));
+    assert_ne!(deleted, seeded);
+
+    apply_in_parity(
+        &preview_doc,
+        &mut preview_undo,
+        &ordinary_doc,
+        &mut ordinary_undo,
+        UndoOrRedo::Undo,
+    );
+    assert_eq!(deep(&preview_doc), seeded);
+    let preview_restored = preview_outer
+        .get("nested")
+        .unwrap()
+        .into_container()
+        .unwrap();
+    let ordinary_restored = ordinary_outer
+        .get("nested")
+        .unwrap()
+        .into_container()
+        .unwrap();
+    assert_ne!(preview_restored.id(), preview_original_nested);
+    assert_ne!(ordinary_restored.id(), ordinary_original_nested);
+    assert_eq!(preview_restored.id(), ordinary_restored.id());
+
+    // Redo must follow the newly created container IDs through the remap.
+    apply_in_parity(
+        &preview_doc,
+        &mut preview_undo,
+        &ordinary_doc,
+        &mut ordinary_undo,
+        UndoOrRedo::Redo,
+    );
+    assert_eq!(deep(&preview_doc), deleted);
+    assert!(preview_outer.get("nested").is_none());
+    assert!(ordinary_outer.get("nested").is_none());
+
+    // A second reinsertion exercises the accumulated remap rather than a
+    // fresh-manager path and must still reconstruct the complete nested state.
+    apply_in_parity(
+        &preview_doc,
+        &mut preview_undo,
+        &ordinary_doc,
+        &mut ordinary_undo,
+        UndoOrRedo::Undo,
+    );
+    assert_eq!(deep(&preview_doc), seeded);
 }
 
 #[test]
