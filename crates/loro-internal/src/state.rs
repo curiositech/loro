@@ -174,10 +174,21 @@ pub struct DocState {
     alive_containers_cache: Option<AliveContainersCache>,
 }
 
+#[derive(Clone)]
 struct AliveContainersCache {
     frontiers: Frontiers,
     roots: Vec<ContainerIdx>,
     indices: Arc<FxHashSet<ContainerIdx>>,
+}
+
+pub(crate) struct UndoTransactionStateRollback {
+    frontiers: Frontiers,
+    store: ContainerStore,
+    in_txn: bool,
+    changed_idx_in_txn: FxHashSet<ContainerIdx>,
+    event_recorder: EventRecorder,
+    dead_containers_cache: DeadContainersCache,
+    alive_containers_cache: Option<AliveContainersCache>,
 }
 
 const ALIVE_CONTAINERS_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -505,6 +516,30 @@ impl DocState {
             dead_containers_cache: Default::default(),
             alive_containers_cache: None,
         }))
+    }
+
+    pub(crate) fn checkpoint_for_undo_transaction(&mut self) -> UndoTransactionStateRollback {
+        UndoTransactionStateRollback {
+            frontiers: self.frontiers.clone(),
+            store: self
+                .store
+                .checkpoint_for_transaction_rollback(self.peer.clone(), self.config.clone()),
+            in_txn: self.in_txn,
+            changed_idx_in_txn: self.changed_idx_in_txn.clone(),
+            event_recorder: self.event_recorder.clone(),
+            dead_containers_cache: self.dead_containers_cache.clone(),
+            alive_containers_cache: self.alive_containers_cache.clone(),
+        }
+    }
+
+    pub(crate) fn rollback_undo_transaction(&mut self, rollback: UndoTransactionStateRollback) {
+        self.frontiers = rollback.frontiers;
+        self.store = rollback.store;
+        self.in_txn = rollback.in_txn;
+        self.changed_idx_in_txn = rollback.changed_idx_in_txn;
+        self.event_recorder = rollback.event_recorder;
+        self.dead_containers_cache = rollback.dead_containers_cache;
+        self.alive_containers_cache = rollback.alive_containers_cache;
     }
 
     pub fn start_recording(&mut self) {

@@ -31,9 +31,18 @@ fn fork_and_detached_editing_follow_contract() -> anyhow::Result<()> {
     doc.set_detached_editing(true);
     assert_ne!(doc.peer_id(), 1);
     text.insert(0, "X")?;
+    let detached_peer = doc.peer_id();
     doc.attach();
     assert!(!doc.is_detached());
+    assert_ne!(doc.peer_id(), detached_peer);
     assert_eq!(doc.get_text("text").to_string(), "Xhello");
+
+    // Regression: attach owns the transaction guard while renewing the peer.
+    // The old path recursively acquired that guard, poisoned it, and aborted
+    // during cleanup. A later edit and commit prove the guard remains usable.
+    text.insert(6, "!")?;
+    doc.commit();
+    assert_eq!(doc.get_text("text").to_string(), "Xhello!");
 
     Ok(())
 }

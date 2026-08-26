@@ -39,8 +39,64 @@ use super::{
     event::{InternalContainerDiff, InternalDocDiff},
     handler::{ListHandler, MapHandler, TextHandler, TreeHandler},
     oplog::OpLog,
-    state::DocState,
+    state::{DocState, UndoTransactionStateRollback},
 };
+
+#[cfg(test)]
+type TransactionTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+fn transaction_test_hook(
+    slot: &'static std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, TransactionTestHook>>,
+    >,
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, TransactionTestHook>> {
+    slot.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+static BEFORE_TRANSACTION_LOCKS_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, TransactionTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static UNDO_TRANSACTION_PAUSED_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, TransactionTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn doc_test_id(doc: &LoroDoc) -> usize {
+    &**doc as *const LoroDocInner as usize
+}
+
+#[cfg(test)]
+fn run_transaction_test_hook(
+    slot: &'static std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, TransactionTestHook>>,
+    >,
+    doc: usize,
+) {
+    let hook = transaction_test_hook(slot).lock().unwrap().remove(&doc);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_transaction_locks_hook_for_test(doc: &LoroDoc, hook: TransactionTestHook) {
+    transaction_test_hook(&BEFORE_TRANSACTION_LOCKS_HOOK)
+        .lock()
+        .unwrap()
+        .insert(doc_test_id(doc), hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_undo_transaction_paused_hook_for_test(doc: &LoroDoc, hook: TransactionTestHook) {
+    transaction_test_hook(&UNDO_TRANSACTION_PAUSED_HOOK)
+        .lock()
+        .unwrap()
+        .insert(doc_test_id(doc), hook);
+}
 
 impl crate::LoroDoc {
     /// Create a new transaction.
@@ -58,13 +114,32 @@ impl crate::LoroDoc {
     /// The origin will be propagated to the events.
     /// There can only be one active transaction at a time for a [LoroDoc].
     pub fn txn_with_origin(&self, origin: &str) -> Result<Transaction, LoroError> {
+        self.txn_with_origin_impl(origin, false)
+    }
+
+    pub(crate) fn txn_with_origin_for_undo_barrier(
+        &self,
+        origin: &str,
+    ) -> Result<Transaction, LoroError> {
+        self.txn_with_origin_impl(origin, true)
+    }
+
+    fn txn_with_origin_impl(
+        &self,
+        origin: &str,
+        allow_undo_barrier: bool,
+    ) -> Result<Transaction, LoroError> {
         if !self.can_edit() {
             return Err(LoroError::TransactionError(
                 String::from("LoroDoc is in readonly detached mode. To make it writable in detached mode, call `set_detached_editing(true)`.").into_boxed_str(),
             ));
         }
 
-        let mut txn = Transaction::new_with_origin(self.inner.clone(), origin.into())?;
+        let mut txn = if allow_undo_barrier {
+            Transaction::new_for_undo_barrier(self.inner.clone(), origin.into())?
+        } else {
+            Transaction::new_with_origin(self.inner.clone(), origin.into())?
+        };
 
         let obs = self.observer.clone();
         let local_update_subs_weak = self.local_update_subs.downgrade();
@@ -92,35 +167,46 @@ impl crate::LoroDoc {
     }
 
     pub fn start_auto_commit(&self) {
-        self.auto_commit
-            .store(true, std::sync::atomic::Ordering::Release);
-        let mut self_txn = self.txn.lock();
-        if self_txn.is_some() || !self.can_edit() {
-            return;
-        }
+        self.with_undo_binding_lock(|| {
+            self.auto_commit
+                .store(true, std::sync::atomic::Ordering::Release);
+            let mut self_txn = self.txn.lock();
+            if self_txn.is_some() || !self.can_edit() {
+                return;
+            }
 
-        let txn = self
-            .txn()
-            .expect("auto-commit should be able to create a transaction");
-        self_txn.replace(txn);
+            let txn = self
+                .txn()
+                .expect("auto-commit should be able to create a transaction");
+            self_txn.replace(txn);
+        });
     }
 
     #[inline]
     pub fn renew_txn_if_auto_commit(&self, options: Option<CommitOptions>) {
-        if self.auto_commit.load(std::sync::atomic::Ordering::Acquire) && self.can_edit() {
-            let mut self_txn = self.txn.lock();
-            if self_txn.is_some() {
-                return;
-            }
+        self.with_undo_binding_lock(|| {
+            if self.auto_commit.load(std::sync::atomic::Ordering::Acquire) && self.can_edit() {
+                let mut self_txn = self.txn.lock();
+                if self_txn.is_some() {
+                    return;
+                }
 
-            let mut txn = self
-                .txn()
-                .expect("auto-commit should be able to renew a transaction");
-            if let Some(options) = options {
-                txn.set_options(options);
+                let mut txn = match self.txn() {
+                    Ok(txn) => txn,
+                    // An explicit transaction admitted before this renewal is
+                    // still authoritative. Leave auto-commit empty; the next
+                    // implicit edit will start it after that transaction ends.
+                    Err(LoroError::DuplicatedTransactionError) => return,
+                    Err(error) => {
+                        panic!("auto-commit should be able to renew a transaction: {error:?}")
+                    }
+                };
+                if let Some(options) = options {
+                    txn.set_options(options);
+                }
+                self_txn.replace(txn);
             }
-            self_txn.replace(txn);
-        }
+        });
     }
 
     #[inline]
@@ -134,9 +220,16 @@ impl crate::LoroDoc {
                 return;
             }
 
-            let mut txn = self
-                .txn()
-                .expect("auto-commit should be able to renew a transaction");
+            let mut txn = match self.txn() {
+                Ok(txn) => txn,
+                // See `renew_txn_if_auto_commit`: an already-admitted explicit
+                // transaction wins admission and will be followed by the next
+                // implicit edit restarting auto-commit.
+                Err(LoroError::DuplicatedTransactionError) => return,
+                Err(error) => {
+                    panic!("auto-commit should be able to renew a transaction: {error:?}")
+                }
+            };
             if let Some(options) = options {
                 txn.set_options(options);
             }
@@ -161,11 +254,20 @@ pub struct Transaction {
     event_hints: FxHashMap<ContainerIdx, Vec<EventHint>>,
     pub(super) arena: SharedArena,
     finished: bool,
+    undo_state_rollback: Option<UndoTransactionStateRollback>,
     on_commit: Option<OnCommitFn>,
     timestamp: Option<Timestamp>,
     msg: Option<Arc<str>>,
     latest_timestamp: Timestamp,
     pub(super) is_peer_first_appearance: bool,
+}
+
+struct PausedUndoTransaction<'a>(&'a mut Transaction);
+
+impl Drop for PausedUndoTransaction<'_> {
+    fn drop(&mut self) {
+        self.0.resume_after_undo_diff();
+    }
 }
 
 impl std::fmt::Debug for Transaction {
@@ -338,11 +440,61 @@ impl Transaction {
     }
 
     pub fn new_with_origin(doc: Arc<LoroDocInner>, origin: InternalString) -> LoroResult<Self> {
-        let oplog_lock = doc.oplog.lock();
+        Self::new_with_origin_inner(doc, origin, false)
+    }
+
+    pub(crate) fn new_for_undo_barrier(
+        doc: Arc<LoroDocInner>,
+        origin: InternalString,
+    ) -> LoroResult<Self> {
+        Self::new_with_origin_inner(doc, origin, true)
+    }
+
+    fn new_with_origin_inner(
+        doc: Arc<LoroDocInner>,
+        origin: InternalString,
+        allow_undo_barrier: bool,
+    ) -> LoroResult<Self> {
+        if !allow_undo_barrier
+            && doc
+                .undo_barrier_active
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(LoroError::DuplicatedTransactionError);
+        }
+
+        #[cfg(test)]
+        if !allow_undo_barrier {
+            run_transaction_test_hook(&BEFORE_TRANSACTION_LOCKS_HOOK, Arc::as_ptr(&doc) as usize);
+        }
+
+        let mut oplog_lock = doc.oplog.lock();
         let mut state_lock = doc.state.lock();
+        // The first flag read is only a fast-path rejection. A transaction may
+        // have passed it and then waited for these locks while an undo barrier
+        // became active. Recheck while transaction admission is serialized by
+        // both locks, before observing/starting DocState's transaction.
+        if !allow_undo_barrier
+            && doc
+                .undo_barrier_active
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(LoroError::DuplicatedTransactionError);
+        }
         if state_lock.is_in_txn() {
             return Err(LoroError::DuplicatedTransactionError);
         }
+
+        let mut undo_state_rollback = if allow_undo_barrier {
+            // Local transaction operations update DocState and the in-memory
+            // DAG eagerly, before commit. Keep a complete materialized-state
+            // checkpoint plus the oplog's existing rollback journal so an
+            // error or panic can restore both halves without auto-committing.
+            oplog_lock.begin_import_rollback();
+            Some(state_lock.checkpoint_for_undo_transaction())
+        } else {
+            None
+        };
 
         state_lock.start_txn(origin, crate::event::EventTriggerKind::Local);
         let arena = state_lock.arena.clone();
@@ -354,7 +506,12 @@ impl Transaction {
         if let Err(err) =
             oplog_lock.check_change_greater_than_last_peer_id(peer, next_counter, &frontiers)
         {
-            state_lock.abort_txn();
+            if let Some(rollback) = undo_state_rollback.take() {
+                state_lock.rollback_undo_transaction(rollback);
+                oplog_lock.rollback_import();
+            } else {
+                state_lock.abort_txn();
+            }
             return Err(err);
         }
         drop(state_lock);
@@ -373,11 +530,38 @@ impl Transaction {
             event_hints: Default::default(),
             local_ops: RleVec::new(),
             finished: false,
+            undo_state_rollback,
             on_commit: None,
             msg: None,
             latest_timestamp,
             is_peer_first_appearance: false,
         })
+    }
+
+    fn pause_for_undo_diff(&mut self) {
+        debug_assert!(self.local_ops.is_empty());
+        if let Some(doc) = self.doc.upgrade() {
+            doc.state.lock().abort_txn();
+        }
+    }
+
+    fn resume_after_undo_diff(&mut self) {
+        debug_assert!(self.local_ops.is_empty());
+        if let Some(doc) = self.doc.upgrade() {
+            doc.state
+                .lock()
+                .start_txn(self.origin.clone(), crate::event::EventTriggerKind::Local);
+        }
+    }
+
+    pub(crate) fn with_paused_for_undo_diff<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.pause_for_undo_diff();
+        let _resume = PausedUndoTransaction(self);
+        #[cfg(test)]
+        if let Some(doc) = _resume.0.doc.upgrade() {
+            run_transaction_test_hook(&UNDO_TRANSACTION_PAUSED_HOOK, Arc::as_ptr(&doc) as usize);
+        }
+        f()
     }
 
     pub fn set_origin(&mut self, origin: InternalString) {
@@ -427,6 +611,23 @@ impl Transaction {
         self._commit()
     }
 
+    fn rollback_undo_transaction(&mut self, doc: &Arc<LoroDocInner>) {
+        let Some(rollback) = self.undo_state_rollback.take() else {
+            return;
+        };
+        let mut oplog = doc.oplog.lock();
+        let mut state = doc.state.lock();
+        state.rollback_undo_transaction(rollback);
+        oplog.uncommitted_change = None;
+        oplog.rollback_import();
+    }
+
+    fn commit_undo_transaction_rollback(&mut self, doc: &Arc<LoroDocInner>) {
+        if self.undo_state_rollback.take().is_some() {
+            doc.oplog.lock().commit_import_rollback();
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     fn _commit(&mut self) -> Result<Option<CommitOptions>, LoroError> {
         if self.finished {
@@ -436,10 +637,19 @@ impl Transaction {
         let Some(doc) = self.doc.upgrade() else {
             return Ok(None);
         };
-        self.finished = true;
+        // Normal transactions retain their historical commit-on-drop/error
+        // behavior. Undo-barrier transactions stay armed until their oplog and
+        // materialized state have both committed, so unwinding invokes the
+        // rollback path in Drop.
+        if self.undo_state_rollback.is_none() {
+            self.finished = true;
+        }
         if self.local_ops.is_empty() {
             let mut state = doc.state.lock();
             state.abort_txn();
+            drop(state);
+            self.commit_undo_transaction_rollback(&doc);
+            self.finished = true;
             return Ok(Some(self.take_options()));
         }
 
@@ -478,9 +688,10 @@ impl Transaction {
         let mut state = doc.state.lock();
 
         let Some(mut change) = oplog.uncommitted_change.take() else {
-            state.abort_txn();
             drop(state);
             drop(oplog);
+            self.rollback_undo_transaction(&doc);
+            self.finished = true;
             return Err(LoroError::internal(
                 "missing uncommitted change while committing transaction",
             ));
@@ -498,9 +709,10 @@ impl Transaction {
 
         let last_id = change.id_last();
         if let Err(err) = oplog.import_local_change(change) {
-            state.abort_txn();
             drop(state);
             drop(oplog);
+            self.rollback_undo_transaction(&doc);
+            self.finished = true;
             return Err(err);
         }
 
@@ -524,6 +736,8 @@ impl Transaction {
         );
         drop(state);
         drop(oplog);
+        self.commit_undo_transaction_rollback(&doc);
+        self.finished = true;
         if let Some(on_commit) = self.on_commit.take() {
             assert!(!doc.txn.is_locked());
             on_commit(&doc.state.clone(), &doc.oplog.clone(), self.id_span());
@@ -736,8 +950,15 @@ impl Drop for Transaction {
     #[tracing::instrument(level = "debug", skip(self))]
     fn drop(&mut self) {
         if !self.finished {
-            // TODO: should we abort here or commit here?
-            // what if commit fails?
+            if let Some(doc) = self.doc.upgrade() {
+                if self.undo_state_rollback.is_some() {
+                    self.rollback_undo_transaction(&doc);
+                    self.finished = true;
+                    return;
+                }
+            }
+            // Preserve the historical behavior for ordinary explicit
+            // transactions and empty undo-barrier transactions.
             self._commit().unwrap();
         }
     }
@@ -994,7 +1215,7 @@ fn change_to_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cursor::PosType, version::Frontiers};
+    use crate::{cursor::PosType, undo::UndoManager, version::Frontiers};
 
     #[test]
     fn txn_creation_rolls_back_in_txn_after_peer_conflict() {
@@ -1019,5 +1240,38 @@ mod tests {
             LoroError::ConcurrentOpsWithSamePeerID { peer: 7, .. }
         ));
         assert!(!doc.app_state().lock().is_in_txn());
+    }
+
+    #[test]
+    fn undo_pause_and_barrier_release_after_error_and_panic() {
+        let doc = LoroDoc::new();
+
+        let error = doc.with_undo_barrier(|_, _| Err::<(), _>(LoroError::UndoPreviewStale));
+        assert!(matches!(error, Err(LoroError::UndoPreviewStale)));
+        assert!(doc.txn().is_ok(), "error must release the undo barrier");
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: LoroResult<()> = doc.with_undo_barrier(|options, _| {
+                let mut txn = doc.txn_with_origin_for_undo_barrier("panic-test")?;
+                if let Some(options) = options.clone() {
+                    txn.set_options(options);
+                }
+                txn.with_paused_for_undo_diff(|| panic!("undo diff failpoint"));
+                #[allow(unreachable_code)]
+                Ok(())
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(doc.txn().is_ok(), "panic must release the undo barrier");
+
+        let undo = UndoManager::new(&doc);
+        let text = doc.get_text("text");
+        text.insert(0, "after-panic", PosType::Unicode).unwrap();
+        assert!(undo.undo().unwrap());
+        assert_eq!(text.to_string(), "");
+
+        text.insert(0, "still-usable", PosType::Unicode).unwrap();
+        assert!(undo.undo().unwrap());
+        assert_eq!(text.to_string(), "");
     }
 }

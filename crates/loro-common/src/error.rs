@@ -79,6 +79,14 @@ pub enum LoroError {
     UndoWithDifferentPeerId { expected: PeerID, actual: PeerID },
     #[error("There is already an active undo group, call `group_end` first")]
     UndoGroupAlreadyStarted,
+    #[error("Undo/redo preview is unavailable while on_push or on_pop callbacks are installed")]
+    UndoPreviewCallbacksInstalled,
+    #[error("Undo/redo preview belongs to a different UndoManager")]
+    UndoPreviewWrongManager,
+    #[error("Undo/redo preview was created for a different action")]
+    UndoPreviewWrongAction,
+    #[error("Undo/redo preview is stale because the document or UndoManager changed")]
+    UndoPreviewStale,
     #[error("There is no active undo group, call `group_start` first")]
     InvalidJsonSchema,
     #[error("Cannot insert or delete utf-8 in the middle of the codepoint in Unicode")]

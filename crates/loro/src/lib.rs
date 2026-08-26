@@ -17,7 +17,7 @@ pub use loro_internal::pre_commit::{
     PreCommitCallbackPayload,
 };
 pub use loro_internal::sync;
-pub use loro_internal::undo::{OnPop, UndoItemMeta, UndoOrRedo};
+pub use loro_internal::undo::{OnPop, UndoItemMeta, UndoOrRedo, UndoPreview};
 use loro_internal::version::shrink_frontiers;
 pub use loro_internal::version::ImVersionVector;
 use loro_internal::DocState;
@@ -3871,6 +3871,32 @@ impl UndoManager {
     /// Redo the last change made by the peer.
     pub fn redo(&mut self) -> LoroResult<bool> {
         self.0.redo()
+    }
+
+    /// Preview the exact next undo without applying it.
+    ///
+    /// The returned value is an opaque, state-bound token. Preview creation is
+    /// O(n) in the document history/materialized state plus the undo/redo
+    /// stacks and accumulated remote diffs. It fails closed while undo manager
+    /// callbacks are installed.
+    pub fn preview_undo(&mut self) -> LoroResult<Option<UndoPreview>> {
+        self.0.preview_undo()
+    }
+
+    /// Preview the exact next redo without applying it.
+    ///
+    /// See [`Self::preview_undo`] for complexity and token validity details.
+    pub fn preview_redo(&mut self) -> LoroResult<Option<UndoPreview>> {
+        self.0.preview_redo()
+    }
+
+    /// Atomically apply a previously created undo/redo preview.
+    ///
+    /// This consumes the opaque token. A token from another manager or action,
+    /// or one made stale by any intervening bound document/manager change, is
+    /// rejected before stack or document mutation.
+    pub fn apply_preview(&mut self, action: UndoOrRedo, preview: UndoPreview) -> LoroResult<bool> {
+        self.0.apply_preview(action, preview)
     }
 
     /// Record a new checkpoint.
