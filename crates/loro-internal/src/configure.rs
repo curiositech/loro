@@ -236,7 +236,7 @@ pub trait SecureRandomGenerator: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::Ordering, Mutex, OnceLock};
+    use std::sync::{atomic::Ordering, Arc, Barrier, Mutex, OnceLock};
 
     use loro_common::{ContainerID, ContainerType, InternalString};
 
@@ -356,6 +356,57 @@ mod tests {
             .read()
             .get(&InternalString::from("fork-only"))
             .is_none());
+    }
+
+    #[test]
+    fn configure_fork_keeps_revision_and_values_coherent_while_mutations_race() {
+        const ITERATIONS: u64 = 2_048;
+
+        let config = Arc::new(Configure::default());
+        let race_start = Arc::new(Barrier::new(2));
+        let race_end = Arc::new(Barrier::new(2));
+        let writer_config = config.clone();
+        let writer_start = race_start.clone();
+        let writer_end = race_end.clone();
+        let writer = std::thread::spawn(move || {
+            for revision in 1..=ITERATIONS {
+                writer_start.wait();
+                // Alternate between the same two values so a value-only
+                // snapshot cannot hide an intervening ABA mutation.
+                writer_config.set_merge_interval((revision % 2) as i64);
+                writer_end.wait();
+            }
+        });
+
+        let mut snapshots = Vec::with_capacity(ITERATIONS as usize);
+        for _ in 1..=ITERATIONS {
+            race_start.wait();
+            let forked = config.fork();
+            snapshots.push((forked.revision(), forked.merge_interval()));
+            race_end.wait();
+        }
+        writer.join().unwrap();
+
+        for (revision, merge_interval) in snapshots {
+            let expected = if revision == 0 {
+                1_000
+            } else {
+                (revision % 2) as i64
+            };
+            assert_eq!(
+                merge_interval, expected,
+                "fork mixed configuration revision {revision} with another revision's value"
+            );
+        }
+
+        assert_eq!(config.revision(), ITERATIONS);
+        assert_eq!(config.merge_interval(), (ITERATIONS % 2) as i64);
+
+        // fork() must remain safe when a caller already owns the same
+        // document-binding authority; this is why the authority is reentrant.
+        let nested = config.with_undo_binding_lock(|| config.fork());
+        assert_eq!(nested.revision(), config.revision());
+        assert_eq!(nested.merge_interval(), config.merge_interval());
     }
 
     #[test]
