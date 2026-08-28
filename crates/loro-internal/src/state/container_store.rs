@@ -344,6 +344,20 @@ impl ContainerStore {
         }
     }
 
+    pub(crate) fn checkpoint_for_transaction_rollback(
+        &mut self,
+        peer: Arc<AtomicU64>,
+        config: Configure,
+    ) -> ContainerStore {
+        ContainerStore {
+            store: self.store.fork(self.arena.clone(), &config),
+            arena: self.arena.clone(),
+            conf: config,
+            peer,
+            shallow_root_store: self.shallow_root_store.clone(),
+        }
+    }
+
     #[allow(unused)]
     fn check_eq_after_parsing(&mut self, other: &mut ContainerStore) {
         for (idx, container) in self.store.iter_all_containers_mut() {

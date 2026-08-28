@@ -68,6 +68,8 @@ mod tree_many_siblings;
 mod tree_movable;
 #[path = "contracts/tree_position.rs"]
 mod tree_position;
+#[path = "contracts/undo_preview.rs"]
+mod undo_preview;
 #[path = "contracts/value_conversion.rs"]
 mod value_conversion;
 #[path = "contracts/value_diff.rs"]

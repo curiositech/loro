@@ -1129,6 +1129,33 @@ impl Handler {
         Ok(())
     }
 
+    fn apply_map_container_diff_value_with_txn(
+        map: &MapHandler,
+        txn: &mut Transaction,
+        key: &str,
+        old_id: ContainerID,
+        on_container_remap: &mut dyn FnMut(ContainerID, ContainerID),
+    ) -> LoroResult<()> {
+        if old_id.is_mergeable() {
+            let parent_id = map.id();
+            let kind = old_id.container_type();
+            let new_id = ContainerID::new_mergeable(&parent_id, key, kind);
+            let marker = loro_common::mergeable_marker(&parent_id, key, kind);
+            map.insert_without_skipping_with_txn(txn, key, marker)?;
+            on_container_remap(old_id, new_id);
+            return Ok(());
+        }
+
+        let new_h = map.insert_container_with_txn(
+            txn,
+            key,
+            Handler::new_unattached(old_id.container_type()),
+        )?;
+        let new_id = new_h.id();
+        on_container_remap(old_id, new_id);
+        Ok(())
+    }
+
     pub(crate) fn new_attached(id: ContainerID, doc: LoroDoc) -> Self {
         let kind = id.container_type();
         let handler = BasicHandler {
@@ -1424,6 +1451,196 @@ impl Handler {
             Self::Unknown(_) => {
                 // do nothing
             }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn apply_diff_with_txn(
+        &self,
+        txn: &mut Transaction,
+        diff: Diff,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+    ) -> LoroResult<()> {
+        let on_container_remap = &mut |old_id, new_id| {
+            if old_id != new_id {
+                container_remap.insert(old_id, new_id);
+            }
+        };
+        match self {
+            Self::Map(x) => {
+                let diff = match diff {
+                    crate::event::Diff::Map(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for map container".into(),
+                        ));
+                    }
+                };
+                for (key, value) in diff.updated {
+                    match value.value {
+                        Some(ValueOrHandler::Handler(h)) => {
+                            Self::apply_map_container_diff_value_with_txn(
+                                x,
+                                txn,
+                                &key,
+                                h.id(),
+                                on_container_remap,
+                            )?;
+                        }
+                        Some(ValueOrHandler::Value(LoroValue::Container(old_id))) => {
+                            Self::apply_map_container_diff_value_with_txn(
+                                x,
+                                txn,
+                                &key,
+                                old_id,
+                                on_container_remap,
+                            )?;
+                        }
+                        Some(ValueOrHandler::Value(v)) => {
+                            x.insert_without_skipping_with_txn(txn, &key, v)?;
+                        }
+                        None => x.delete_with_txn(txn, &key)?,
+                    }
+                }
+            }
+            Self::Text(x) => {
+                let delta = match diff {
+                    crate::event::Diff::Text(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for text container".into(),
+                        ));
+                    }
+                };
+                x.apply_delta_with_txn(txn, &TextDelta::from_text_diff(delta.iter()))?;
+            }
+            Self::List(x) => {
+                let delta = match diff {
+                    crate::event::Diff::List(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for list container".into(),
+                        ));
+                    }
+                };
+                x.apply_delta_with_txn(txn, delta, on_container_remap)?;
+            }
+            Self::MovableList(x) => {
+                let delta = match diff {
+                    crate::event::Diff::List(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for movable list container".into(),
+                        ));
+                    }
+                };
+                x.apply_delta_with_txn(txn, delta, container_remap)?;
+            }
+            Self::Tree(x) => {
+                fn remap_tree_id(
+                    id: &mut TreeID,
+                    container_remap: &FxHashMap<ContainerID, ContainerID>,
+                ) {
+                    let mut remapped = false;
+                    let mut map_id = id.associated_meta_container();
+                    while let Some(rid) = container_remap.get(&map_id) {
+                        remapped = true;
+                        map_id = rid.clone();
+                    }
+                    if remapped {
+                        *id = TreeID::new(
+                            *map_id.as_normal().unwrap().0,
+                            *map_id.as_normal().unwrap().1,
+                        );
+                    }
+                }
+
+                let tree_diff = match diff {
+                    crate::event::Diff::Tree(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for tree container".into(),
+                        ));
+                    }
+                };
+                for diff in tree_diff.diff {
+                    let mut target = diff.target;
+                    match diff.action {
+                        TreeExternalDiff::Create {
+                            mut parent,
+                            index: _,
+                            position,
+                        } => {
+                            if let TreeParentId::Node(p) = &mut parent {
+                                remap_tree_id(p, container_remap);
+                            }
+                            remap_tree_id(&mut target, container_remap);
+                            if !x.is_node_unexist(&target) && !x.is_node_deleted(&target)? {
+                                x.move_at_with_target_for_apply_diff_with_txn(
+                                    txn, parent, position, target,
+                                )?;
+                            } else {
+                                let new_target = TreeID::from_id(txn.next_id());
+                                if x.create_at_with_target_for_apply_diff_with_txn(
+                                    txn, parent, position, new_target,
+                                )? {
+                                    container_remap.insert(
+                                        target.associated_meta_container(),
+                                        new_target.associated_meta_container(),
+                                    );
+                                }
+                            }
+                        }
+                        TreeExternalDiff::Move {
+                            mut parent,
+                            index: _,
+                            position,
+                            old_parent: _,
+                            old_index: _,
+                        } => {
+                            if let TreeParentId::Node(p) = &mut parent {
+                                remap_tree_id(p, container_remap);
+                            }
+                            remap_tree_id(&mut target, container_remap);
+                            if x.is_node_unexist(&target) || x.is_node_deleted(&target)? {
+                                let new_target = TreeID::from_id(txn.next_id());
+                                if x.create_at_with_target_for_apply_diff_with_txn(
+                                    txn, parent, position, new_target,
+                                )? {
+                                    container_remap.insert(
+                                        target.associated_meta_container(),
+                                        new_target.associated_meta_container(),
+                                    );
+                                }
+                            } else {
+                                x.move_at_with_target_for_apply_diff_with_txn(
+                                    txn, parent, position, target,
+                                )?;
+                            }
+                        }
+                        TreeExternalDiff::Delete { .. } => {
+                            remap_tree_id(&mut target, container_remap);
+                            if !x.is_node_deleted(&target)? {
+                                x.delete_with_txn(txn, target)?;
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "counter")]
+            Self::Counter(x) => {
+                let delta = match diff {
+                    crate::event::Diff::Counter(d) => d,
+                    _ => {
+                        return Err(LoroError::DecodeError(
+                            "Invalid diff type for counter container".into(),
+                        ));
+                    }
+                };
+                x.increment_with_txn(txn, delta)?;
+            }
+            Self::Unknown(_) => {}
         }
 
         Ok(())
@@ -3461,50 +3678,59 @@ impl ListHandler {
     ) -> LoroResult<()> {
         match &self.inner {
             MaybeDetached::Detached(_) => unimplemented!(),
-            MaybeDetached::Attached(_) => {
-                let mut index = 0;
-                for item in delta.iter() {
-                    match item {
-                        loro_delta::DeltaItem::Retain { len, .. } => {
-                            index += len;
-                        }
-                        loro_delta::DeltaItem::Replace { value, delete, .. } => {
-                            if *delete > 0 {
-                                self.delete(index, *delete)?;
-                            }
+            MaybeDetached::Attached(a) => {
+                a.with_txn(|txn| self.apply_delta_with_txn(txn, delta, on_container_remap))?
+            }
+        }
 
-                            for v in value.iter() {
-                                match v {
-                                    ValueOrHandler::Value(LoroValue::Container(old_id)) => {
-                                        let new_h = self.insert_container(
-                                            index,
-                                            Handler::new_unattached(old_id.container_type()),
-                                        )?;
-                                        let new_id = new_h.id();
-                                        on_container_remap(old_id.clone(), new_id);
-                                    }
-                                    ValueOrHandler::Handler(h) => {
-                                        let old_id = h.id();
-                                        let new_h = self.insert_container(
-                                            index,
-                                            Handler::new_unattached(old_id.container_type()),
-                                        )?;
-                                        let new_id = new_h.id();
-                                        on_container_remap(old_id, new_id);
-                                    }
-                                    ValueOrHandler::Value(v) => {
-                                        self.insert(index, v.clone())?;
-                                    }
-                                }
+        Ok(())
+    }
 
-                                index += 1;
+    fn apply_delta_with_txn(
+        &self,
+        txn: &mut Transaction,
+        delta: loro_delta::DeltaRope<
+            loro_delta::array_vec::ArrayVec<ValueOrHandler, 8>,
+            crate::event::ListDeltaMeta,
+        >,
+        on_container_remap: &mut dyn FnMut(ContainerID, ContainerID),
+    ) -> LoroResult<()> {
+        let mut index = 0;
+        for item in delta.iter() {
+            match item {
+                loro_delta::DeltaItem::Retain { len, .. } => index += len,
+                loro_delta::DeltaItem::Replace { value, delete, .. } => {
+                    if *delete > 0 {
+                        self.delete_with_txn(txn, index, *delete)?;
+                    }
+                    for v in value.iter() {
+                        match v {
+                            ValueOrHandler::Value(LoroValue::Container(old_id)) => {
+                                let new_h = self.insert_container_with_txn(
+                                    txn,
+                                    index,
+                                    Handler::new_unattached(old_id.container_type()),
+                                )?;
+                                on_container_remap(old_id.clone(), new_h.id());
+                            }
+                            ValueOrHandler::Handler(h) => {
+                                let old_id = h.id();
+                                let new_h = self.insert_container_with_txn(
+                                    txn,
+                                    index,
+                                    Handler::new_unattached(old_id.container_type()),
+                                )?;
+                                on_container_remap(old_id, new_h.id());
+                            }
+                            ValueOrHandler::Value(v) => {
+                                self.insert_with_txn(txn, index, v.clone())?;
                             }
                         }
+                        index += 1;
                     }
                 }
             }
         }
-
         Ok(())
     }
 
@@ -4292,6 +4518,29 @@ impl MapHandler {
         }
     }
 
+    fn insert_without_skipping_with_txn(
+        &self,
+        txn: &mut Transaction,
+        key: &str,
+        value: impl Into<LoroValue>,
+    ) -> LoroResult<()> {
+        let value = value.into();
+        ensure_no_regular_container_value(&value)?;
+        let inner = self.inner.try_attached_state()?;
+        txn.apply_local_op(
+            inner.container_idx,
+            crate::op::RawOpContent::Map(crate::container::map::MapSet {
+                key: key.into(),
+                value: Some(value.clone()),
+            }),
+            EventHint::Map {
+                key: key.into(),
+                value: Some(value),
+            },
+            &inner.doc,
+        )
+    }
+
     pub fn insert_with_txn(
         &self,
         txn: &mut Transaction,
@@ -4831,7 +5080,7 @@ pub mod counter {
             }
         }
 
-        fn increment_with_txn(&self, txn: &mut Transaction, n: f64) -> LoroResult<()> {
+        pub(super) fn increment_with_txn(&self, txn: &mut Transaction, n: f64) -> LoroResult<()> {
             let inner = self.inner.try_attached_state()?;
             txn.apply_local_op(
                 inner.container_idx,

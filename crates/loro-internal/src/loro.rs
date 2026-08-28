@@ -40,7 +40,7 @@ use crate::{change::ChangeRef, lock::LockKind};
 use crate::{lock::LoroMutexGuard, pre_commit::PreCommitCallback};
 use crate::{
     lock::{LoroLockGroup, LoroMutex},
-    txn::Transaction,
+    txn::{OnCommitFn, Transaction},
 };
 use either::Either;
 use loro_common::{
@@ -101,6 +101,14 @@ impl std::fmt::Debug for LoroDocInner {
     }
 }
 
+struct UndoBarrierFlagGuard<'a>(&'a AtomicBool);
+
+impl Drop for UndoBarrierFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Release);
+    }
+}
+
 impl LoroDoc {
     /// Run the provided closure within a commit barrier.
     ///
@@ -119,6 +127,55 @@ impl LoroDoc {
         drop(guard);
         self.renew_txn_if_auto_commit(options);
         result
+    }
+
+    /// Run an undo-preview apply critical section while retaining the shared
+    /// transaction guard used by every clone of this document.
+    ///
+    /// The closure receives the pending empty-transaction options so
+    /// neutralized pops can carry them forward without releasing the guard.
+    pub(crate) fn with_undo_barrier<R>(
+        &self,
+        f: impl FnOnce(&mut Option<CommitOptions>, &mut dyn FnMut()) -> LoroResult<R>,
+    ) -> LoroResult<R> {
+        let _binding_guard = self.config.undo_binding_lock().lock();
+        if !self.can_edit() {
+            return Err(LoroError::EditWhenDetached);
+        }
+
+        let (mut options, txn) = self.implicit_commit_then_stop();
+        if self
+            .undo_barrier_active
+            .compare_exchange(false, true, Acquire, Acquire)
+            .is_err()
+        {
+            self._renew_txn_if_auto_commit_with_guard(options, txn);
+            return Err(LoroError::DuplicatedTransactionError);
+        }
+        let mut barrier_flag = Some(UndoBarrierFlagGuard(&self.undo_barrier_active));
+        let mut txn = Some(txn);
+        let mut release = || {
+            drop(barrier_flag.take());
+            drop(txn.take());
+        };
+        // Never unwind while either the shared auto-transaction mutex or the
+        // explicit-transaction exclusion flag is held. Besides leaving the
+        // flag stuck, unwinding through the mutex guard would poison it and
+        // make every later edit on every clone unusable.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(&mut options, &mut release)
+        }));
+        drop(release);
+        drop(barrier_flag.take());
+        if let Some(txn) = txn.take() {
+            self._renew_txn_if_auto_commit_with_guard(options, txn);
+        } else {
+            self.renew_txn_if_auto_commit(options);
+        }
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     pub fn new() -> Self {
@@ -142,6 +199,7 @@ impl LoroDoc {
                     lock_group.new_lock(DiffCalculator::new(true), LockKind::DiffCalculator),
                 ),
                 txn: global_txn,
+                undo_barrier_active: AtomicBool::new(false),
                 arena,
                 local_update_subs: SubscriberSetWithQueue::new(),
                 peer_id_change_subs: SubscriberSetWithQueue::new(),
@@ -150,6 +208,10 @@ impl LoroDoc {
             }
         });
         LoroDoc { inner }
+    }
+
+    pub(crate) fn with_undo_binding_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.config.with_undo_binding_lock(f)
     }
 
     pub fn fork(&self) -> Self {
@@ -189,12 +251,12 @@ impl LoroDoc {
     ///   It also doesn't change the version of the [DocState]. The changes will be
     ///   recorded into [OpLog] only. You need to call `checkout` to make it take effect.
     pub fn set_detached_editing(&self, enable: bool) {
-        self.config.set_detached_editing(enable);
-        if enable && self.is_detached() {
-            self.with_barrier(|| {
+        self.with_undo_binding_lock(|| {
+            self.config.set_detached_editing(enable);
+            if enable && self.is_detached() {
                 self.renew_peer_id();
-            });
-        }
+            }
+        });
     }
 
     /// Create a doc with auto commit enabled.
@@ -210,22 +272,23 @@ impl LoroDoc {
         if peer == PeerID::MAX {
             return Err(LoroError::InvalidPeerID);
         }
-        let next_id = self.oplog.lock().next_id(peer);
-        if self.auto_commit.load(Acquire) {
-            let doc_state = self.state.lock();
-            doc_state
-                .peer
-                .store(peer, std::sync::atomic::Ordering::Relaxed);
-
-            if doc_state.is_in_txn() {
-                drop(doc_state);
-                // Use implicit-style barrier to avoid swallowing next-commit options
-                self.with_barrier(|| {});
-            }
+        self.with_undo_binding_lock(|| {
+            let next_id = self.with_barrier(|| self.set_peer_id_with_barrier(peer))?;
             self.peer_id_change_subs.emit(&(), next_id);
-            return Ok(());
-        }
+            Ok(())
+        })
+    }
 
+    /// Change the peer while the caller retains the shared transaction guard.
+    ///
+    /// Checkout/attach paths already hold that guard for their entire state
+    /// transition. Re-entering [`Self::with_barrier`] from those paths attempts
+    /// to acquire the transaction mutex twice and violates the document lock
+    /// order. Keeping this primitive private preserves the public
+    /// binding-lock -> transaction-barrier admission path.
+    fn set_peer_id_with_barrier(&self, peer: PeerID) -> LoroResult<ID> {
+        debug_assert!(self.txn.is_locked());
+        let next_id = self.oplog.lock().next_id(peer);
         let doc_state = self.state.lock();
         if doc_state.is_in_txn() {
             return Err(LoroError::TransactionError(
@@ -234,13 +297,10 @@ impl LoroDoc {
                     .into_boxed_str(),
             ));
         }
-
         doc_state
             .peer
             .store(peer, std::sync::atomic::Ordering::Relaxed);
-        drop(doc_state);
-        self.peer_id_change_subs.emit(&(), next_id);
-        Ok(())
+        Ok(next_id)
     }
 
     /// Renews the PeerID for the document.
@@ -250,6 +310,15 @@ impl LoroDoc {
             peer_id = DefaultRandom.next_u64();
         }
         self.set_peer_id(peer_id).unwrap();
+    }
+
+    fn renew_peer_id_with_barrier(&self) {
+        let mut peer_id = DefaultRandom.next_u64();
+        while peer_id == PeerID::MAX {
+            peer_id = DefaultRandom.next_u64();
+        }
+        let next_id = self.set_peer_id_with_barrier(peer_id).unwrap();
+        self.peer_id_change_subs.emit(&(), next_id);
     }
 
     /// Implicitly commit the cumulative auto-commit transaction.
@@ -473,7 +542,7 @@ impl LoroDoc {
     /// the largest existing timestamp will be used instead.
     #[inline]
     pub fn set_record_timestamp(&self, record: bool) {
-        self.config.set_record_timestamp(record);
+        self.with_undo_binding_lock(|| self.config.set_record_timestamp(record));
     }
 
     /// Set the interval of mergeable changes, in seconds.
@@ -482,11 +551,19 @@ impl LoroDoc {
     /// The default value is 1000 seconds.
     #[inline]
     pub fn set_change_merge_interval(&self, interval: i64) {
-        self.config.set_merge_interval(interval);
+        self.with_undo_binding_lock(|| self.config.set_merge_interval(interval));
     }
 
     pub fn can_edit(&self) -> bool {
         !self.is_detached() || self.config.detached_editing()
+    }
+
+    pub(crate) fn auto_commit_enabled(&self) -> bool {
+        self.auto_commit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn emit_deferred_commit(&self, callback: OnCommitFn, id_span: IdSpan) {
+        callback(&self.state, &self.oplog, id_span);
     }
 
     pub fn is_detached_editing_enabled(&self) -> bool {
@@ -495,12 +572,12 @@ impl LoroDoc {
 
     #[inline]
     pub fn config_text_style(&self, text_style: StyleConfigMap) {
-        self.config.text_style_config.write().map = text_style.map;
+        self.config.set_text_style_config(text_style);
     }
 
     #[inline]
     pub fn config_default_text_style(&self, text_style: Option<StyleConfig>) {
-        self.config.text_style_config.write().default_style = text_style;
+        self.config.set_default_text_style(text_style);
     }
     pub fn from_snapshot(bytes: &[u8]) -> LoroResult<Self> {
         let doc = Self::new();
@@ -544,7 +621,7 @@ impl LoroDoc {
     }
 
     pub(crate) fn set_detached(&self, detached: bool) {
-        self.detached.store(detached, Release);
+        self.with_undo_binding_lock(|| self.detached.store(detached, Release));
     }
 
     #[inline(always)]
@@ -1184,20 +1261,90 @@ impl LoroDoc {
     /// further when it's needed. The time complexity is O(n + m), n is the ops in the id_span, m is the
     /// distance from id_span to the current latest version.
     #[instrument(level = "info", skip_all)]
-    pub fn undo_internal(
+    pub(crate) fn undo_internal_with<T>(
         &self,
-        id_span: IdSpan,
+        validate: &mut dyn FnMut() -> LoroResult<()>,
+        prepare: impl FnOnce() -> LoroResult<Option<(IdSpan, DiffBatch, T)>>,
         container_remap: &mut FxHashMap<ContainerID, ContainerID>,
-        post_transform_base: Option<&DiffBatch>,
         before_diff: &mut dyn FnMut(&DiffBatch),
-    ) -> LoroResult<CommitWhenDrop<'_>> {
+    ) -> LoroResult<Option<(CommitWhenDrop<'_>, T)>> {
         if !self.can_edit() {
             return Err(LoroError::EditWhenDetached);
         }
 
         let (options, txn) = self.implicit_commit_then_stop();
+        if let Err(err) = validate() {
+            self._renew_txn_if_auto_commit_with_guard(options, txn);
+            return Err(err);
+        }
+
+        let Some((diff, payload)) = (match self.calculate_undo_diff(prepare, before_diff) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                self._renew_txn_if_auto_commit_with_guard(options, txn);
+                return Err(err);
+            }
+        }) else {
+            self._renew_txn_if_auto_commit_with_guard(options, txn);
+            return Ok(None);
+        };
+        drop(txn);
+        self.start_auto_commit();
+        // Try applying the diff, but ignore the error if it happens.
+        // MovableList's undo behavior is too tricky to handle in a collaborative env
+        // so in edge cases this may be an Error
+        if let Err(e) = self._apply_diff(diff, container_remap, true) {
+            warn!("Undo Failed {:?}", e);
+        }
+
+        if let Some(options) = options {
+            self.set_next_commit_options(options);
+        }
+        Ok(Some((
+            CommitWhenDrop {
+                doc: self,
+                default_options: CommitOptions::new().origin("undo"),
+            },
+            payload,
+        )))
+    }
+
+    /// Apply one undo candidate while the caller retains the document-wide
+    /// transaction guard. Empty/neutralized candidates carry pending commit
+    /// options forward to the next candidate without releasing that guard.
+    pub(crate) fn undo_internal_with_barrier<T>(
+        &self,
+        prepare: impl FnOnce() -> LoroResult<Option<(IdSpan, DiffBatch, T)>>,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+        before_diff: &mut dyn FnMut(&DiffBatch),
+        txn: &mut Transaction,
+    ) -> LoroResult<Option<T>> {
+        // Historical checkout cannot run while DocState is in a transaction.
+        // Keep the same explicit Transaction object alive, but briefly pause
+        // its empty state transaction; `undo_barrier_active` rejects every
+        // competing explicit transaction throughout this calculation.
+        let calculated =
+            txn.with_paused_for_undo_diff(|| self.calculate_undo_diff(prepare, before_diff));
+        let Some((diff, payload)) = calculated? else {
+            return Ok(None);
+        };
+
+        if let Err(e) = self._apply_diff_with_txn(diff, container_remap, true, txn) {
+            warn!("Undo Failed {:?}", e);
+        }
+        Ok(Some(payload))
+    }
+
+    fn calculate_undo_diff<T>(
+        &self,
+        prepare: impl FnOnce() -> LoroResult<Option<(IdSpan, DiffBatch, T)>>,
+        before_diff: &mut dyn FnMut(&DiffBatch),
+    ) -> LoroResult<Option<(DiffBatch, T)>> {
+        let Some((id_span, post_transform_base, payload)) = prepare()? else {
+            return Ok(None);
+        };
+
         if !self.oplog().lock().vv().includes_id(id_span.id_last()) {
-            self.renew_txn_if_auto_commit(options);
             return Err(LoroError::UndoInvalidIdSpan(id_span.id_last()));
         }
 
@@ -1211,10 +1358,7 @@ impl LoroDoc {
         let spans = self.oplog.lock().split_span_based_on_deps(id_span);
         let diff = crate::undo::undo(
             spans,
-            match post_transform_base {
-                Some(d) => Either::Right(d),
-                None => Either::Left(&latest_frontiers),
-            },
+            Either::Right(&post_transform_base),
             |from, to| {
                 self._checkout_without_emitting(from, false, false).unwrap();
                 self.state.lock().start_recording();
@@ -1227,30 +1371,12 @@ impl LoroDoc {
             before_diff,
         );
 
-        // println!("\nundo_internal: diff: {:?}", diff);
-        // println!("container remap: {:?}", container_remap);
-
         self._checkout_without_emitting(&latest_frontiers, false, false)?;
         self.set_detached(false);
         if was_recording {
             self.state.lock().start_recording();
         }
-        drop(txn);
-        self.start_auto_commit();
-        // Try applying the diff, but ignore the error if it happens.
-        // MovableList's undo behavior is too tricky to handle in a collaborative env
-        // so in edge cases this may be an Error
-        if let Err(e) = self._apply_diff(diff, container_remap, true) {
-            warn!("Undo Failed {:?}", e);
-        }
-
-        if let Some(options) = options {
-            self.set_next_commit_options(options);
-        }
-        Ok(CommitWhenDrop {
-            doc: self,
-            default_options: CommitOptions::new().origin("undo"),
-        })
+        Ok(Some((diff, payload)))
     }
 
     /// Generate a series of local operations that can revert the current doc to the target
@@ -1383,6 +1509,58 @@ impl LoroDoc {
                 });
             };
             if let Err(e) = h.apply_diff(diff, container_remap) {
+                ans = Err(e);
+            }
+        }
+
+        if !missing_containers.is_empty() {
+            return Err(LoroError::ContainersNotFound {
+                containers: Box::new(missing_containers),
+            });
+        }
+
+        ans
+    }
+
+    pub(crate) fn _apply_diff_with_txn(
+        &self,
+        diff: DiffBatch,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+        skip_unreachable: bool,
+        txn: &mut Transaction,
+    ) -> LoroResult<()> {
+        if !self.can_edit() {
+            return Err(LoroError::EditWhenDetached);
+        }
+
+        let mut ans: LoroResult<()> = Ok(());
+        let mut missing_containers: Vec<ContainerID> = Vec::new();
+        for (mut id, diff) in diff.into_iter() {
+            let mut remapped = false;
+            while let Some(rid) = container_remap.get(&id) {
+                remapped = true;
+                id = rid.clone();
+            }
+
+            if matches!(&id, ContainerID::Normal { .. }) && self.arena.id_to_idx(&id).is_none() {
+                let exists = self.state.lock().does_container_exist(&id);
+                if !exists {
+                    missing_containers.push(id);
+                    continue;
+                }
+                self.state.lock().ensure_container(&id);
+            }
+
+            if skip_unreachable && !remapped && !self.state.lock().get_reachable(&id) {
+                continue;
+            }
+
+            let Some(h) = self.get_handler(id.clone()) else {
+                return Err(LoroError::ContainersNotFound {
+                    containers: Box::new(vec![id]),
+                });
+            };
+            if let Err(e) = h.apply_diff_with_txn(txn, diff, container_remap) {
                 ans = Err(e);
             }
         }
@@ -1668,7 +1846,10 @@ impl LoroDoc {
             // We don't need to shrink frontiers because oplog's frontiers are already shrinked.
             this.emit_events();
             if this.config.detached_editing() {
-                this.renew_peer_id();
+                // The checkout caller already owns the transaction barrier.
+                // Re-entering the public peer setter here would recursively
+                // acquire the transaction mutex.
+                this.renew_peer_id_with_barrier();
             }
 
             self.set_detached(false);
@@ -2456,33 +2637,30 @@ impl LoroDoc {
     }
 
     pub fn delete_root_container(&self, cid: ContainerID) {
-        if !cid.is_root() {
-            return;
-        }
+        self.with_undo_binding_lock(|| {
+            if !cid.is_root() {
+                return;
+            }
 
-        // Do not treat "not in arena" as non-existence; consult state/kv
-        if !self.has_container(&cid) {
-            return;
-        }
+            // Do not treat "not in arena" as non-existence; consult state/kv
+            if !self.has_container(&cid) {
+                return;
+            }
 
-        let Some(h) = self.get_handler(cid.clone()) else {
-            return;
-        };
+            let Some(h) = self.get_handler(cid.clone()) else {
+                return;
+            };
 
-        self.config
-            .deleted_root_containers
-            .lock()
-            .insert(cid.clone());
-        if let Err(e) = h.clear() {
-            self.config.deleted_root_containers.lock().remove(&cid);
-            eprintln!("Failed to clear handler: {:?}", e);
-        }
+            self.config.mark_root_deleted(cid.clone());
+            if let Err(e) = h.clear() {
+                self.config.unmark_root_deleted(&cid);
+                eprintln!("Failed to clear handler: {:?}", e);
+            }
+        });
     }
 
     pub fn set_hide_empty_root_containers(&self, hide: bool) {
-        self.config
-            .hide_empty_root_containers
-            .store(hide, std::sync::atomic::Ordering::Relaxed);
+        self.config.set_hide_empty_root_containers(hide);
     }
 }
 

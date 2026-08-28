@@ -35,6 +35,21 @@ impl MovableListHandler {
         >,
         container_remap: &mut FxHashMap<ContainerID, ContainerID>,
     ) -> LoroResult<()> {
+        let MaybeDetached::Attached(a) = &self.inner else {
+            unimplemented!();
+        };
+        a.with_txn(|txn| self.apply_delta_with_txn(txn, delta, container_remap))
+    }
+
+    pub(super) fn apply_delta_with_txn(
+        &self,
+        txn: &mut Transaction,
+        delta: loro_delta::DeltaRope<
+            loro_delta::array_vec::ArrayVec<ValueOrHandler, 8>,
+            crate::event::ListDeltaMeta,
+        >,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+    ) -> LoroResult<()> {
         {
             // Test whether the delta is valid
             let len = self.len();
@@ -60,9 +75,7 @@ impl MovableListHandler {
         }
 
         match &self.inner {
-            MaybeDetached::Detached(_) => {
-                unimplemented!();
-            }
+            MaybeDetached::Detached(_) => unimplemented!(),
             MaybeDetached::Attached(_) => {
                 // use tracing::debug;
                 // debug!(
@@ -113,15 +126,14 @@ impl MovableListHandler {
                                 next_deleted: &mut next_deleted,
                             };
 
-                            self.process_replacements(value, attr, &mut context)
-                                .unwrap();
+                            self.process_replacements_with_txn(txn, value, attr, &mut context)?;
                             delta_change.push(value.len() as isize);
                         }
                     }
                 }
 
                 // Apply any remaining deletions.
-                self.apply_remaining_deletions(delta_change, &mut deleted_indices)?;
+                self.apply_remaining_deletions_with_txn(txn, delta_change, &mut deleted_indices)?;
                 Ok(())
             }
         }
@@ -208,8 +220,9 @@ impl MovableListHandler {
     /// * `values` - The values to insert or move.
     /// * `attr` - Additional attributes for the delta item.
     /// * `context` - A context struct containing related parameters.
-    fn process_replacements(
+    fn process_replacements_with_txn(
         &self,
+        txn: &mut Transaction,
         values: &loro_delta::array_vec::ArrayVec<ValueOrHandler, 8>,
         attr: &crate::event::ListDeltaMeta,
         context: &mut ReplacementContext,
@@ -217,14 +230,14 @@ impl MovableListHandler {
         for v in values.iter() {
             match v {
                 ValueOrHandler::Value(LoroValue::Container(old_id)) => {
-                    self.apply_insertion(attr, context, old_id.clone())?;
+                    self.apply_insertion_with_txn(txn, attr, context, old_id.clone())?;
                 }
                 ValueOrHandler::Handler(handler) => {
                     let old_id = handler.id();
-                    self.apply_insertion(attr, context, old_id)?;
+                    self.apply_insertion_with_txn(txn, attr, context, old_id)?;
                 }
                 ValueOrHandler::Value(value) => {
-                    self.insert(*context.index, value.clone())?;
+                    self.insert_with_txn(txn, *context.index, value.clone())?;
                     Self::update_positions_on_insert(context.to_delete, *context.index, 1);
                     *context.index += 1;
                     *context.index_shift += 1;
@@ -235,8 +248,9 @@ impl MovableListHandler {
         Ok(())
     }
 
-    fn apply_insertion(
+    fn apply_insertion_with_txn(
         &self,
+        txn: &mut Transaction,
         attr: &crate::event::ListDeltaMeta,
         context: &mut ReplacementContext<'_>,
         mut old_id: ContainerID,
@@ -254,7 +268,7 @@ impl MovableListHandler {
                 ensure_cov::notify_cov(
                     "loro_internal::handler::movable_list_apply_delta::process_replacements::mov_0",
                 );
-                self.mov(old_index, *context.index)?;
+                self.move_with_txn(txn, old_index, *context.index)?;
                 context.next_deleted.push(Reverse(old_index));
                 *context.index += 1;
                 *context.index_shift += 1;
@@ -262,14 +276,15 @@ impl MovableListHandler {
                 ensure_cov::notify_cov(
                     "loro_internal::handler::movable_list_apply_delta::process_replacements::mov_1",
                 );
-                self.mov(old_index, *context.index - 1)?;
+                self.move_with_txn(txn, old_index, *context.index - 1)?;
             }
             context.deleted_indices.push(old_index);
             Self::update_positions_on_delete(context.to_delete, old_index);
             Self::update_positions_on_insert(context.to_delete, *context.index, 1);
         } else if !attr.from_move || !self.contains_container(&old_id) {
             // Insert a new container if not moved.
-            let new_handler = self.insert_container(
+            let new_handler = self.insert_container_with_txn(
+                txn,
                 *context.index,
                 Handler::new_unattached(old_id.container_type()),
             )?;
@@ -297,8 +312,9 @@ impl MovableListHandler {
     ///
     /// * `delta` - The delta containing the deletions.
     /// * `deleted_indices` - A list of indices that have been deleted.
-    fn apply_remaining_deletions(
+    fn apply_remaining_deletions_with_txn(
         &self,
+        txn: &mut Transaction,
         delta: Vec<isize>,
         deleted_indices: &mut Vec<usize>,
     ) -> LoroResult<()> {
@@ -328,7 +344,7 @@ impl MovableListHandler {
                         }
                     }
 
-                    self.delete(index, remaining_deletes)?;
+                    self.delete_with_txn(txn, index, remaining_deletes)?;
                 }
             }
         }

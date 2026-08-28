@@ -162,6 +162,9 @@ pub struct LoroDocInner {
     /// We need to lock txn and keep it None because otherwise the DocState may change due to a parallel edit on a new Txn,
     /// which may break the invariants of `import`, `export` and `checkout`.
     txn: Arc<LoroMutex<Option<Transaction>>>,
+    /// Excludes explicit transactions while undo/redo temporarily checks out
+    /// historical state under the shared auto-transaction barrier.
+    undo_barrier_active: AtomicBool,
     auto_commit: AtomicBool,
     detached: AtomicBool,
     local_update_subs: SubscriberSetWithQueue<(), LocalUpdateCallback, Vec<u8>>,

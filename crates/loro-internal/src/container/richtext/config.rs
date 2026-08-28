@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 
 use super::{ExpandType, TextStyleInfoFlag};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StyleConfigMap {
     pub(crate) map: FxHashMap<InternalString, StyleConfig>,
     pub(crate) default_style: Option<StyleConfig>,

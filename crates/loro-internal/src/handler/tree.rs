@@ -2,8 +2,8 @@ use std::{collections::VecDeque, sync::Arc};
 
 use fractional_index::FractionalIndex;
 use loro_common::{
-    ContainerID, ContainerType, Counter, IdFull, IdLp, LoroError, LoroResult, LoroTreeError,
-    LoroValue, PeerID, TreeID, ID,
+    ContainerID, ContainerType, Counter, IdFull, LoroError, LoroResult, LoroTreeError, LoroValue,
+    PeerID, TreeID, ID,
 };
 use rustc_hash::FxHashMap;
 use smallvec::smallvec;
@@ -443,7 +443,18 @@ impl TreeHandler {
         let MaybeDetached::Attached(a) = &self.inner else {
             unreachable!();
         };
+        a.with_txn(|txn| {
+            self.create_at_with_target_for_apply_diff_with_txn(txn, parent, position, target)
+        })
+    }
 
+    pub(crate) fn create_at_with_target_for_apply_diff_with_txn(
+        &self,
+        txn: &mut Transaction,
+        parent: TreeParentId,
+        position: FractionalIndex,
+        target: TreeID,
+    ) -> LoroResult<bool> {
         if let Some(p) = self.get_node_parent(&target) {
             if p == parent {
                 return Ok(false);
@@ -452,11 +463,15 @@ impl TreeHandler {
             match p {
                 TreeParentId::Node(p) => {
                     if !self.is_node_unexist(&target) && !self.is_node_deleted(&p)? {
-                        return self.move_at_with_target_for_apply_diff(parent, position, target);
+                        return self.move_at_with_target_for_apply_diff_with_txn(
+                            txn, parent, position, target,
+                        );
                     }
                 }
                 TreeParentId::Root => {
-                    return self.move_at_with_target_for_apply_diff(parent, position, target);
+                    return self.move_at_with_target_for_apply_diff_with_txn(
+                        txn, parent, position, target,
+                    );
                 }
                 TreeParentId::Deleted | TreeParentId::Unexist => {}
             }
@@ -479,40 +494,41 @@ impl TreeHandler {
                 &parent,
                 &NodePosition {
                     position: position.clone(),
-                    idlp: self.next_idlp(),
+                    idlp: txn.next_idlp(),
                 },
             )
             // TODO: parent has deleted？
             .unwrap_or(0);
 
-        let children = a.with_txn(|txn| {
-            let inner = self.inner.try_attached_state()?;
-
-            txn.apply_local_op(
-                inner.container_idx,
-                crate::op::RawOpContent::Tree(Arc::new(TreeOp::Create {
-                    target,
-                    parent: parent.tree_id(),
+        let inner = self.inner.try_attached_state()?;
+        txn.apply_local_op(
+            inner.container_idx,
+            crate::op::RawOpContent::Tree(Arc::new(TreeOp::Create {
+                target,
+                parent: parent.tree_id(),
+                position: position.clone(),
+            })),
+            EventHint::Tree(smallvec![TreeDiffItem {
+                target,
+                action: TreeExternalDiff::Create {
+                    parent,
+                    index,
                     position: position.clone(),
-                })),
-                EventHint::Tree(smallvec![TreeDiffItem {
-                    target,
-                    action: TreeExternalDiff::Create {
-                        parent,
-                        index,
-                        position: position.clone(),
-                    },
-                }]),
-                &inner.doc,
-            )?;
-
-            Ok(self
-                .children(&TreeParentId::Node(target))
-                .unwrap_or_default())
-        })?;
+                },
+            }]),
+            &inner.doc,
+        )?;
+        let children = self
+            .children(&TreeParentId::Node(target))
+            .unwrap_or_default();
         for child in children {
             let position = self.get_position_by_tree_id(&child).unwrap();
-            self.create_at_with_target_for_apply_diff(TreeParentId::Node(target), position, child)?;
+            self.create_at_with_target_for_apply_diff_with_txn(
+                txn,
+                TreeParentId::Node(target),
+                position,
+                child,
+            )?;
         }
         Ok(true)
     }
@@ -527,7 +543,18 @@ impl TreeHandler {
         let MaybeDetached::Attached(a) = &self.inner else {
             unreachable!();
         };
+        a.with_txn(|txn| {
+            self.move_at_with_target_for_apply_diff_with_txn(txn, parent, position, target)
+        })
+    }
 
+    pub(crate) fn move_at_with_target_for_apply_diff_with_txn(
+        &self,
+        txn: &mut Transaction,
+        parent: TreeParentId,
+        position: FractionalIndex,
+        target: TreeID,
+    ) -> LoroResult<bool> {
         // // the move node does not exist, create it
         // if self.is_node_unexist(&target) || self.is_node_deleted(&target).unwrap() {
         //     return self.create_at_with_target_for_apply_diff(parent, position, target);
@@ -549,7 +576,7 @@ impl TreeHandler {
                 &parent,
                 &NodePosition {
                     position: position.clone(),
-                    idlp: self.next_idlp(),
+                    idlp: txn.next_idlp(),
                 },
             )
             .unwrap_or(0);
@@ -570,29 +597,26 @@ impl TreeHandler {
         //     target, parent
         // );
 
-        a.with_txn(|txn| {
-            let inner = self.inner.try_attached_state()?;
-            txn.apply_local_op(
-                inner.container_idx,
-                crate::op::RawOpContent::Tree(Arc::new(TreeOp::Move {
-                    target,
-                    parent: parent.tree_id(),
+        let inner = self.inner.try_attached_state()?;
+        txn.apply_local_op(
+            inner.container_idx,
+            crate::op::RawOpContent::Tree(Arc::new(TreeOp::Move {
+                target,
+                parent: parent.tree_id(),
+                position: position.clone(),
+            })),
+            EventHint::Tree(smallvec![TreeDiffItem {
+                target,
+                action: TreeExternalDiff::Move {
+                    parent,
+                    index,
                     position: position.clone(),
-                })),
-                EventHint::Tree(smallvec![TreeDiffItem {
-                    target,
-                    action: TreeExternalDiff::Move {
-                        parent,
-                        index,
-                        position: position.clone(),
-                        // the old parent should be exist, so we can unwrap
-                        old_parent,
-                        old_index,
-                    },
-                }]),
-                &inner.doc,
-            )
-        })?;
+                    old_parent,
+                    old_index,
+                },
+            }]),
+            &inner.doc,
+        )?;
         Ok(true)
     }
 
@@ -1075,15 +1099,6 @@ impl TreeHandler {
                 let a = state.as_tree_state().unwrap();
                 a.get_index_by_position(parent, node_position)
             }),
-        }
-    }
-
-    pub(crate) fn next_idlp(&self) -> IdLp {
-        match &self.inner {
-            MaybeDetached::Detached(_) => {
-                unreachable!()
-            }
-            MaybeDetached::Attached(a) => a.with_txn(|txn| Ok(txn.next_idlp())).unwrap(),
         }
     }
 
